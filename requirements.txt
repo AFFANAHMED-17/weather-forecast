@@ -1,0 +1,7 @@
+Flask
+requests
+python-dotenv
+flask-cors
+geopy
+pandas
+joblib

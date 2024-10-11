@@ -89,7 +89,7 @@ Make sure to install **Python**, **Flutter**, and **Node.js** on your system.
 1. Navigate to the frontend folder:
 
    ```bash
-   cd ../frontend
+   cd ../weather_app
    ```
 
 2. Install Flutter dependencies:
@@ -121,7 +121,7 @@ After completing both backend and frontend setups:
 1. **Backend**: Ensure your Flask server is running on `http://localhost:3000`.
    
    ```bash
-   cd backend
+   cd backend // go to app.py in terminal
    python app.py
    ```
 

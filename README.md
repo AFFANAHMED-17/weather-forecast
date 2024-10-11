@@ -47,7 +47,7 @@ Make sure to install **Python**, **Flutter**, and **Node.js** on your system.
 1. Clone the repository and navigate to the backend folder:
 
    ```bash
-   git clone https://github.com/yourusername/weather-rain-prediction.git
+   git clone https://github.com/AFFANAHMED-17/weather-rain-prediction.git
    cd weather-rain-prediction/backend
    ```
 

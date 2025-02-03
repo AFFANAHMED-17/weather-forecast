@@ -6,9 +6,12 @@ from flask_cors import CORS
 from geopy.geocoders import Nominatim
 import pandas as pd
 import joblib
+import numpy as np
+from tensorflow.keras.models import load_model
+from tensorflow.keras.losses import MeanSquaredError  
+from datetime import datetime, timedelta
+import random
 
-# Load environment variables from .env file
-load_dotenv()
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -26,11 +29,13 @@ try:
     LOCATION_ENCODER = joblib.load('models/location_encoder.pkl')
     RAIN_TODAY_MODEL = joblib.load('models/rain_today_model.pkl')
     RAIN_TOMORROW_MODEL = joblib.load('models/rain_tomorrow_model.pkl')
+    loaded_model = load_model('models/lag_prediction_model.h5', custom_objects={'mse': MeanSquaredError()})
 except Exception as e:
     print(f"Error loading models: {e}")
     LOCATION_ENCODER = None
     RAIN_TODAY_MODEL = None
     RAIN_TOMORROW_MODEL = None
+    loaded_model = None
 
 @app.route('/api/forecast', methods=['GET'])
 def get_forecast():
@@ -184,5 +189,73 @@ def predict_any():
     else:
         return jsonify({"error": "Provide either a place name or latitude and longitude."}), 400
 
+@app.route('/forecast_simulation', methods=['GET'])
+def forecast_simulation():
+    """
+    Simulates weather forecast data and checks the rain duration to determine match status.
+    """
+    start_time = datetime.now()
+    hours = 48  # Simulate for 48 hours
+
+    # Simulate forecast data
+    simulated_data = simulate_forecast_data(start_time, hours)
+    rain_start, rain_end, duration = calculate_rain_duration(simulated_data)
+
+    if rain_start and rain_end and duration:
+        status = determine_match_status(duration)
+        return jsonify({
+            "simulated_forecast": simulated_data,
+            "rain_start": rain_start.isoformat(),
+            "rain_end": rain_end.isoformat(),
+            "duration": str(duration),
+            "match_status": status
+        })
+    else:
+        return jsonify({"message": "No significant rain detected."})
+
+def simulate_forecast_data(start_time, hours):
+    """Simulate forecast data with varying rain amounts."""
+    forecasts = []
+    for hour in range(hours):
+        current_time = start_time + timedelta(hours=hour)
+        rain_amount = round(random.uniform(0, 1.5), 1) if hour % 2 == 1 else 0.0  # Simulate rain only at odd hours
+        forecasts.append({"time": current_time.strftime("%Y-%m-%dT%H:%M:%S"), "rain": rain_amount})
+    
+    return {"forecasts": forecasts}
+
+def calculate_rain_duration(forecast):
+    rain_start = None
+    rain_end = None
+
+    for entry in forecast["forecasts"]:
+        time = datetime.fromisoformat(entry["time"])
+        rain_amount = entry["rain"]
+        
+        # Check if it starts raining
+        if rain_amount > 0 and rain_start is None:
+            rain_start = time
+        # Check if it stops raining
+        elif rain_amount == 0 and rain_start is not None:
+            rain_end = time
+            break  # Stop checking once rain has stopped
+
+    # If rain never stopped, set rain_end to the last time in forecast
+    if rain_start and rain_end is None:
+        rain_end = time  # Last entry in forecast is considered rain end
+
+    duration = None
+    if rain_start and rain_end:
+        duration = rain_end - rain_start
+
+    return rain_start, rain_end, duration
+
+def determine_match_status(duration):
+    """Determine the match status based on rain duration."""
+    if duration and duration.total_seconds() > 3600:  # If rain duration exceeds 1 hour
+        return "Match"
+    else:
+        return "No match"
+
 if __name__ == '__main__':
-    app.run('0.0.0.0', port=3000, debug=True)
+    app.run(host='0.0.0.0', port=5000,debug=True)
+

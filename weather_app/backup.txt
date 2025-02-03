@@ -1,0 +1,1263 @@
+from flask import Flask, request, jsonify
+import requests
+import os
+from dotenv import load_dotenv
+from flask_cors import CORS
+from geopy.geocoders import Nominatim
+import pandas as pd
+import joblib
+import numpy as np
+from tensorflow.keras.models import load_model
+from tensorflow.keras.losses import MeanSquaredError  
+
+# Load environment variables from .env file
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
+
+# Configuration
+OPENWEATHERMAP_API_KEY = os.getenv('OPENWEATHERMAP_API_KEY')
+WEATHER_FORECAST_URL = "https://api.openweathermap.org/data/2.5/forecast"
+WEATHER_CURRENT_URL = "https://api.openweathermap.org/data/2.5/weather"
+
+# Initialize Geolocator
+geolocator = Nominatim(user_agent="WeatherRainApp")
+
+# Load Models and Encoders
+try:
+    LOCATION_ENCODER = joblib.load('models/location_encoder.pkl')
+    RAIN_TODAY_MODEL = joblib.load('models/rain_today_model.pkl')
+    RAIN_TOMORROW_MODEL = joblib.load('models/rain_tomorrow_model.pkl')
+    loaded_model = load_model('models/lag_prediction_model.h5', custom_objects={'mse': MeanSquaredError()})
+except Exception as e:
+    print(f"Error loading models: {e}")
+    LOCATION_ENCODER = None
+    RAIN_TODAY_MODEL = None
+    RAIN_TOMORROW_MODEL = None
+    loaded_model =None
+
+@app.route('/api/forecast', methods=['GET'])
+def get_forecast():
+    """
+    Fetches a 5-day weather forecast with 3-hour intervals for the given latitude and longitude.
+    """
+    lat = request.args.get('lat')
+    lon = request.args.get('lon')
+    
+    if not lat or not lon:
+        return jsonify({"error": "Please provide both 'lat' and 'lon' parameters."}), 400
+    
+    params = {
+        'lat': lat,
+        'lon': lon,
+        'appid': OPENWEATHERMAP_API_KEY,
+        'units': 'metric'  # Change to 'imperial' if needed
+    }
+    
+    try:
+        response = requests.get(WEATHER_FORECAST_URL, params=params)
+        response.raise_for_status()  # Raise HTTPError for bad responses
+        data = response.json()
+        return jsonify(data)
+    except requests.exceptions.HTTPError as http_err:
+        return jsonify({"error": f"HTTP error occurred: {http_err}"}), response.status_code
+    except Exception as err:
+        return jsonify({"error": f"An error occurred: {err}"}), 500
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    """
+    Predicts rain for today and tomorrow based on a place name.
+    """
+    if not all([LOCATION_ENCODER, RAIN_TODAY_MODEL, RAIN_TOMORROW_MODEL]):
+        return jsonify({"error": "Models are not loaded properly."}), 500
+
+    data = request.get_json()
+    place = data.get('place')
+    
+    if not place:
+        return jsonify({"error": "Place name is required."}), 400
+    
+    # Get latitude and longitude from place name
+    location = geolocator.geocode(place)
+    if not location:
+        return jsonify({"error": "Location not found."}), 404
+    
+    lat = location.latitude
+    lon = location.longitude
+    
+    return predict_rain(lat, lon)
+
+@app.route('/predict_rain', methods=['GET'])
+def predict_rain_route():
+    """
+    Predicts rain for today and tomorrow based on latitude and longitude.
+    """
+    lat = request.args.get('lat')
+    lon = request.args.get('lon')
+    
+    if not lat or not lon:
+        return jsonify({"error": "Please provide both 'lat' and 'lon' parameters."}), 400
+    
+    return predict_rain(lat, lon)
+
+def predict_rain(lat, lon):
+    """
+    Helper function to predict rain based on latitude and longitude.
+    """
+    if not all([LOCATION_ENCODER, RAIN_TODAY_MODEL, RAIN_TOMORROW_MODEL]):
+        return jsonify({"error": "Models are not loaded properly."}), 500
+
+    api_key = OPENWEATHERMAP_API_KEY
+    api_url = f"{WEATHER_CURRENT_URL}?lat={lat}&lon={lon}&appid={api_key}&units=metric"
+
+    response = requests.get(api_url)
+
+    if response.status_code != 200:
+        return jsonify({"error": "Failed to get weather data."}), 400
+
+    weather_data = response.json()
+    location_name = weather_data.get("name", "Unknown Location")
+    current_temp = weather_data["main"]["temp"]
+    humidity = weather_data["main"]["humidity"]
+    pressure = weather_data["main"]["pressure"]
+    wind_speed = weather_data["wind"]["speed"]
+    rainfall = weather_data.get("rain", {}).get("1h", 0)
+
+    # Prepare features for today's prediction
+    features_today = pd.DataFrame({
+        'Location': [location_name],
+        'MinTemp': [current_temp - 2],
+        'MaxTemp': [current_temp + 2],
+        'Rainfall': [rainfall],
+        'Humidity': [humidity],
+        'Pressure': [pressure],
+        'WindSpeed': [wind_speed]
+    })
+
+    # Encode Location
+    if location_name in LOCATION_ENCODER.classes_:
+        features_today['Location'] = LOCATION_ENCODER.transform([location_name])
+    else:
+        features_today['Location'] = -1  # Unknown location
+
+    # Predict Rain Today
+    prediction_today = RAIN_TODAY_MODEL.predict(features_today)
+    
+    # Prepare features for tomorrow's prediction
+    features_tomorrow = pd.DataFrame({
+        'Location': [location_name],
+        'MinTemp': [current_temp - 2],
+        'MaxTemp': [current_temp + 2],
+        'Rainfall': [rainfall],
+        'Humidity': [humidity],
+        'Pressure': [pressure],
+        'WindSpeed': [wind_speed],
+        'RainToday': [prediction_today[0]]
+    })
+
+    # Encode Location
+    if location_name in LOCATION_ENCODER.classes_:
+        features_tomorrow['Location'] = LOCATION_ENCODER.transform([location_name])
+    else:
+        features_tomorrow['Location'] = -1  # Unknown location
+
+    # Predict Rain Tomorrow
+    prediction_tomorrow = RAIN_TOMORROW_MODEL.predict(features_tomorrow)
+
+    return jsonify({
+        "Location": location_name,
+        "RainToday": bool(prediction_today[0]),
+        "RainTomorrow": bool(prediction_tomorrow[0])
+    })
+
+@app.route('/predict_any', methods=['POST'])
+def predict_any():
+    """
+    Predicts rain based on either a place name or latitude and longitude.
+    """
+    data = request.get_json()
+    place = data.get('place')
+    lat = data.get('lat')
+    lon = data.get('lon')
+
+    if place:
+        return predict()
+    elif lat and lon:
+        return predict_rain(lat, lon)
+    else:
+        return jsonify({"error": "Provide either a place name or latitude and longitude."}), 400
+    
+
+
+@app.route('/api/lag_features', methods=['GET'])
+def get_lag_features():
+    # Simulated example data, replace with your actual logic to get the latest lag features
+    latest_features = {
+        "MinTemp": 15.3,
+        "MaxTemp": 25.6,
+        "Rainfall": 0.0,
+        "Humidity": 85.0,
+        "Pressure": 1010.2,
+        "WindSpeed": 5.1
+    }
+    return jsonify(latest_features)
+
+@app.route('/predict_lag', methods=['POST'])
+def predict_lag():
+    try:
+        # Get features from the request
+        data = request.json
+        features = data['features']
+
+        # Prepare input for the model
+        new_data = np.array(features).reshape((1, 1, len(features)))  # Reshape for LSTM input
+
+        # Make prediction using the loaded model
+        predicted_values = loaded_model.predict(new_data)
+
+        # Convert predictions to a list or any other format as required
+        predicted_values_list = predicted_values.flatten().tolist()  # Flatten the array to a list
+
+        return jsonify({"predicted_values": predicted_values_list})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route('/forecast_simulation', methods=['GET'])
+def forecast_simulation():
+    """
+    Simulates weather forecast data and checks the rain duration to determine match status.
+    """
+    start_time = datetime.now()
+    hours = 48  # Simulate for 48 hours
+
+    # Simulate forecast data
+    simulated_data = simulate_forecast_data(start_time, hours)
+    rain_start, rain_end, duration = calculate_rain_duration(simulated_data)
+
+    if rain_start and rain_end and duration:
+        status = determine_match_status(duration)
+        return jsonify({
+            "simulated_forecast": simulated_data,
+            "rain_start": rain_start.isoformat(),
+            "rain_end": rain_end.isoformat(),
+            "duration": str(duration),
+            "match_status": status
+        })
+    else:
+        return jsonify({"message": "No significant rain detected."})
+
+
+@app.route('/live_forecast', methods=['GET'])
+def live_forecast():
+    """
+    Fetches live forecast data and checks the rain duration to determine match status.
+    """
+    lat = request.args.get('lat')
+    lon = request.args.get('lon')
+
+    if not lat or not lon:
+        return jsonify({"error": "Please provide 'lat' and 'lon' parameters."}), 400
+
+    forecast_data = fetch_forecast(lat, lon)
+
+    if forecast_data:
+        parsed_data = parse_forecast_data(forecast_data)
+        rain_start, rain_end, duration = calculate_rain_duration(parsed_data)
+
+        if rain_start and rain_end and duration:
+            status = determine_match_status(duration)
+            return jsonify({
+                "forecast": parsed_data,
+                "rain_start": rain_start.isoformat(),
+                "rain_end": rain_end.isoformat(),
+                "duration": str(duration),
+                "match_status": status
+            })
+        else:
+            return jsonify({"message": "No significant rain detected."})
+    else:
+        return jsonify({"error": "Failed to fetch forecast data."}), 500
+
+
+if __name__ == '__main__':
+    app.run('0.0.0.0', port=3000, debug=True)
+
+
+
+    import requests
+from datetime import datetime, timedelta
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderServiceError
+import random
+
+# Constants
+WEATHER_FORECAST_URL = "https://api.openweathermap.org/data/2.5/forecast"
+OPENWEATHERMAP_API_KEY = "cdb30228749294aab0742f605b2619c0"
+
+def fetch_forecast(lat, lon):
+    """Fetch the weather forecast from OpenWeatherMap API using latitude and longitude."""
+    params = {
+        'lat': lat,
+        'lon': lon,
+        'appid': OPENWEATHERMAP_API_KEY,
+        'units': 'metric'  # For temperature in Celsius
+    }
+    
+    try:
+        response = requests.get(WEATHER_FORECAST_URL, params=params, timeout=10)
+        response.raise_for_status()  # Raise an error for bad responses
+        return response.json()  # Return the JSON response
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching data: {e}")
+        return None
+
+def parse_forecast_data(data):
+    """Parse the forecast data to extract relevant rain information."""
+    forecasts = []
+
+    for entry in data['list']:  # 'list' contains the forecast entries
+        time = entry['dt_txt']  # Date and time
+        rain_amount = entry.get('rain', {}).get('1h', 0.0)  # Rain volume in the last hour
+        forecasts.append({"time": time, "rain": rain_amount})
+    
+    return {"forecasts": forecasts}
+
+def simulate_forecast_data(start_time, hours):
+    """Simulate forecast data with varying rain amounts."""
+    forecasts = []
+    
+    for hour in range(hours):
+        current_time = start_time + timedelta(hours=hour)
+        rain_amount = round(random.uniform(0, 1.5), 1) if hour % 2 == 1 else 0.0  # Simulate rain only at odd hours
+        forecasts.append({"time": current_time.strftime("%Y-%m-%dT%H:%M:%S"), "rain": rain_amount})
+    
+    return {"forecasts": forecasts}
+
+def calculate_rain_duration(forecast):
+    rain_start = None
+    rain_end = None
+
+    for entry in forecast["forecasts"]:
+        time = datetime.fromisoformat(entry["time"])
+        rain_amount = entry["rain"]
+        
+        # Check if it starts raining
+        if rain_amount > 0 and rain_start is None:
+            rain_start = time
+        # Check if it stops raining
+        elif rain_amount == 0 and rain_start is not None:
+            rain_end = time
+            break  # Stop checking once rain has stopped
+
+    # If rain never stopped, set rain_end to the last time in forecast
+    if rain_start is not None and rain_end is None:
+        rain_end = datetime.fromisoformat(forecast["forecasts"][-1]["time"])
+
+    # Calculate duration
+    if rain_start and rain_end:
+        duration = rain_end - rain_start
+        return rain_start, rain_end, duration
+    else:
+        return None, None, None
+
+def get_current_location():
+    """Get the current location's latitude and longitude for Chennai."""
+    geolocator = Nominatim(user_agent="WeatherForecastApp_v1")
+    try:
+        location = geolocator.geocode("Chennai, India", timeout=10)
+        
+        if location:
+            return location.latitude, location.longitude
+        else:
+            print("Could not determine the current location.")
+            return None, None
+    except GeocoderTimedOut:
+        print("Geocoding service timed out. Please try again.")
+        return None, None
+    except GeocoderServiceError as e:
+        print(f"Geocoding service error: {e}")
+        return None, None
+
+def determine_match_status(duration):
+    """Determine the match status based on the rain duration."""
+    if duration.total_seconds() < 1800:  # Less than 30 minutes
+        return "The match will continue as scheduled (extra time may be added)."
+    elif duration.total_seconds() < 11400:  # 30 minutes to 3 hours
+        return "The match will be delayed."
+    else:  # More than 3 hours
+        return "The match may need to be rescheduled or a reserve day may be used."
+
+# Main execution
+if __name__ == "__main__":
+    lat, lon = get_current_location()
+
+    if lat is not None and lon is not None:
+        print(f"Using coordinates: Latitude: {lat}, Longitude: {lon}")
+        forecast_data = fetch_forecast(lat, lon)
+
+        if forecast_data:
+            parsed_data = parse_forecast_data(forecast_data)
+            print(parsed_data)  # Print the formatted forecast data
+            
+            start_time = datetime.now()  # Start from now
+            simulated_data = simulate_forecast_data(start_time, 6)  # Simulate 6 hours of data
+            
+            start_time, end_time, duration = calculate_rain_duration(simulated_data)
+
+            if start_time and end_time:
+                print(f"Simulated rain is expected from {start_time} to {end_time} for a duration of {duration}.")
+                match_status = determine_match_status(duration)
+                print(match_status)
+            else:
+                print("No rain is expected in the forecast.")
+    else:
+        print("Could not fetch the current location.")
+// flutter code//
+void main() {
+  runApp(MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Weather Prediction App',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+      ),
+      home: LoadingPage(),
+    );
+  }
+}
+
+// Loading Page
+class LoadingPage extends StatefulWidget {
+  @override
+  _LoadingPageState createState() => _LoadingPageState();
+}
+
+class _LoadingPageState extends State<LoadingPage> {
+  @override
+  void initState() {
+    super.initState();
+
+    // Simulate a delay or a loading task like fetching data
+    Future.delayed(Duration(seconds: 6), () {
+      // After the delay, navigate to the LoginPage
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (context) => LoginPage()),
+      );
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Stack(
+        children: [
+          // Gradient Background
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Colors.blue[300]!, Colors.blueAccent],
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+              ),
+            ),
+          ),
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20.0),
+              child: Card(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                elevation: 8,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 30, horizontal: 20),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.cloud_outlined,
+                        size: 80,
+                        color: Colors.blueAccent,
+                      ),
+                      SizedBox(height: 20),
+                      Text(
+                        'Weather Prediction App',
+                        style: TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.blueAccent,
+                        ),
+                      ),
+                      SizedBox(height: 30),
+                      CircularProgressIndicator(
+                        valueColor: AlwaysStoppedAnimation<Color>(Colors.blueAccent),
+                      ),
+                      SizedBox(height: 20),
+                      Text(
+                        'Loading...',
+                        style: TextStyle(
+                          fontSize: 18,
+                          color: Colors.black54,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// Login Page
+class LoginPage extends StatefulWidget {
+  @override
+  _LoginPageState createState() => _LoginPageState();
+}
+
+class _LoginPageState extends State<LoginPage> {
+  final TextEditingController _emailController = TextEditingController();
+  final TextEditingController _passwordController = TextEditingController();
+  final _formKey = GlobalKey<FormState>();
+  bool _isLoading = false;
+
+  String correctEmail_1 = 'viswaagatiya.cs22@bitsathy.ac.in';
+  String correctPassword_1 = '11072004';
+  String correctEmail_2 = 'vigneshwaran.cs22@bitsathy.ac.in';
+  String correctPassword_2 = '01112004';
+  String correctEmail_3 = 'affanahmed.cs22@bitsathy.ac.in';
+  String correctPassword_3 = '20092004';
+  String correctEmail_4 = 'riyas.cs22@bitsathy.ac.in';
+  String correctPassword_4 = '12345678';
+
+  void _login() {
+    final email = _emailController.text;
+    final password = _passwordController.text;
+
+    if (_formKey.currentState!.validate()) {
+      setState(() {
+        _isLoading = true;
+      });
+
+      Future.delayed(Duration(seconds: 2), () {
+        setState(() {
+          _isLoading = false;
+        });
+
+        if (email == correctEmail_1 && password == correctPassword_1 ||
+            email == correctEmail_2 && password == correctPassword_2 ||
+            email == correctEmail_3 && password == correctPassword_3 ||
+            email == correctEmail_4 && password == correctPassword_4) {
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(builder: (context) => TabControllerPage()),
+          );
+        } else {
+          _showErrorDialog();
+        }
+      });
+    }
+  }
+
+  void _showErrorDialog() {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text('Login Failed'),
+          content: Text('Incorrect email or password. Please try again.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Stack(
+        children: [
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Colors.blue[300]!, Colors.blueAccent],
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+              ),
+            ),
+          ),
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20.0),
+              child: Card(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                elevation: 8,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 30, horizontal: 20),
+                  child: Form(
+                    key: _formKey,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.cloud_outlined,
+                          size: 80,
+                          color: Colors.blueAccent,
+                        ),
+                        SizedBox(height: 20),
+                        Text(
+                          'Weather Prediction App',
+                          style: TextStyle(
+                            fontSize: 22,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.blueAccent,
+                          ),
+                        ),
+                        SizedBox(height: 20),
+                        TextFormField(
+                          controller: _emailController,
+                          decoration: InputDecoration(
+                            labelText: 'Email',
+                            prefixIcon: Icon(Icons.email),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10.0),
+                            ),
+                          ),
+                          keyboardType: TextInputType.emailAddress,
+                          validator: (value) {
+                            if (value == null || value.isEmpty) {
+                              return 'Please enter your email';
+                            } else if (!RegExp(r'^[^@]+@[^@]+\.[^@]+')
+                                .hasMatch(value)) {
+                              return 'Enter a valid email';
+                            }
+                            return null;
+                          },
+                        ),
+                        SizedBox(height: 15),
+                        TextFormField(
+                          controller: _passwordController,
+                          decoration: InputDecoration(
+                            labelText: 'Password',
+                            prefixIcon: Icon(Icons.lock),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10.0),
+                            ),
+                          ),
+                          obscureText: true,
+                          validator: (value) {
+                            if (value == null || value.isEmpty) {
+                              return 'Please enter your password';
+                            } else if (value.length < 6) {
+                              return 'Password must be at least 6 characters';
+                            }
+                            return null;
+                          },
+                        ),
+                        SizedBox(height: 30),
+                        _isLoading
+                            ? CircularProgressIndicator()
+                            : ElevatedButton(
+                                onPressed: _login,
+                                style: ElevatedButton.styleFrom(
+                                  padding: EdgeInsets.symmetric(
+                                      vertical: 12, horizontal: 50),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                  backgroundColor: Colors.blueAccent,
+                                ),
+                                child: Text(
+                                  'Login',
+                                  style: TextStyle(
+                                    fontSize: 18,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                              ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// TabController Page
+class TabControllerPage extends StatefulWidget {
+  @override
+  _TabControllerPageState createState() => _TabControllerPageState();
+}
+
+class _TabControllerPageState extends State<TabControllerPage> with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 5, vsync: this);
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Weather Prediction'),
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: [
+            Tab(icon: Icon(Icons.home), text: "Home"),
+            Tab(icon: Icon(Icons.search), text: "Search"),
+            Tab(icon: Icon(Icons.history), text: "History"),
+            Tab(icon: Icon(Icons.settings), text: "Settings"),
+            Tab(icon: Icon(Icons.info), text: "About"),
+          ],
+        ),
+      ),
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          Center(child: Text('Home Page')),
+          Center(child: Text('Search Page')),
+          Center(child: Text('History Page')),
+          Center(child: Text('Settings Page')),
+          Center(child: Text('About Page')),
+        ],
+      ),
+    );
+  }
+}
+
+
+
+
+-----------------------------------------
+main.dart
+
+import 'package:flutter/material.dart';
+import 'screens/weather_home_page.dart';
+import 'screens/rain_prediction_screen.dart';
+
+import 'screens/match_details_page.dart';
+
+
+void main() {
+  runApp(WeatherRainApp());
+}
+
+class WeatherRainApp extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Weather & Rain Prediction App',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+      ),
+      home: LoadingPage(), // Start with the Loading Page
+    );
+  }
+}
+
+// Loading Page
+class LoadingPage extends StatefulWidget {
+  @override
+  _LoadingPageState createState() => _LoadingPageState();
+}
+
+class _LoadingPageState extends State<LoadingPage> {
+  @override
+  void initState() {
+    super.initState();
+
+    // Simulate a delay or loading task
+    Future.delayed(Duration(seconds: 6), () {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (context) => LoginPage()),
+      );
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Stack(
+        children: [
+          // Gradient Background
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Colors.blue[300]!, Colors.blueAccent],
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+              ),
+            ),
+          ),
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20.0),
+              child: Card(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                elevation: 8,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 30, horizontal: 20),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.cloud_outlined,
+                        size: 80,
+                        color: Colors.blueAccent,
+                      ),
+                      SizedBox(height: 20),
+                      Text(
+                        'Weather Prediction App',
+                        style: TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.blueAccent,
+                        ),
+                      ),
+                      SizedBox(height: 30),
+                      CircularProgressIndicator(
+                        valueColor: AlwaysStoppedAnimation<Color>(Colors.blueAccent),
+                      ),
+                      SizedBox(height: 20),
+                      Text(
+                        'Loading...',
+                        style: TextStyle(
+                          fontSize: 18,
+                          color: Colors.black54,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// Login Page
+class LoginPage extends StatefulWidget {
+  @override
+  _LoginPageState createState() => _LoginPageState();
+}
+
+class _LoginPageState extends State<LoginPage> {
+  final TextEditingController _emailController = TextEditingController();
+  final TextEditingController _passwordController = TextEditingController();
+  final _formKey = GlobalKey<FormState>();
+  bool _isLoading = false;
+
+  // Dummy email and password for login
+  String correctEmail_1 = 'viswaagatiya.cs22@bitsathy.ac.in';
+  String correctPassword_1 = '11072004';
+  String correctEmail_2 = 'vigneshwaran.cs22@bitsathy.ac.in';
+  String correctPassword_2 = '01112004';
+  String correctEmail_3 = 'affanahmed.cs22@bitsathy.ac.in';
+  String correctPassword_3 = '20092004';
+  String correctEmail_4 = 'riyas.cs22@bitsathy.ac.in';
+  String correctPassword_4 = '12345678';
+  
+
+  void _login() {
+    final email = _emailController.text;
+    final password = _passwordController.text;
+
+    if (_formKey.currentState!.validate()) {
+      setState(() {
+        _isLoading = true;
+      });
+
+      Future.delayed(Duration(seconds: 2), () {
+        setState(() {
+          _isLoading = false;
+        });
+
+        if (email == correctEmail_1 && password == correctPassword_1 ||
+            email == correctEmail_2 && password == correctPassword_2 ||
+            email == correctEmail_3 && password == correctPassword_3 ||
+            email == correctEmail_4 && password == correctPassword_4) {
+          Navigator.pushReplacement(
+              context, MaterialPageRoute(builder: (context) => MainTabControllerPage()));
+        } else {
+          _showErrorDialog();
+        }
+      });
+    }
+  }
+
+  void _showErrorDialog() {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text('Login Failed'),
+          content: Text('Incorrect email or password. Please try again.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Stack(
+        children: [
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Colors.blue[300]!, Colors.blueAccent],
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+              ),
+            ),
+          ),
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20.0),
+              child: Card(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                elevation: 8,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 30, horizontal: 20),
+                  child: Form(
+                    key: _formKey,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.cloud_outlined,
+                          size: 80,
+                          color: Colors.blueAccent,
+                        ),
+                        SizedBox(height: 20),
+                        Text(
+                          'Weather Prediction App',
+                          style: TextStyle(
+                            fontSize: 22,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.blueAccent,
+                          ),
+                        ),
+                        SizedBox(height: 20),
+                        TextFormField(
+                          controller: _emailController,
+                          decoration: InputDecoration(
+                            labelText: 'Email',
+                            prefixIcon: Icon(Icons.email),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10.0),
+                            ),
+                          ),
+                          keyboardType: TextInputType.emailAddress,
+                          validator: (value) {
+                            if (value == null || value.isEmpty) {
+                              return 'Please enter your email';
+                            } else if (!RegExp(r'^[^@]+@[^@]+\.[^@]+').hasMatch(value)) {
+                              return 'Enter a valid email';
+                            }
+                            return null;
+                          },
+                        ),
+                        SizedBox(height: 15),
+                        TextFormField(
+                          controller: _passwordController,
+                          decoration: InputDecoration(
+                            labelText: 'Password',
+                            prefixIcon: Icon(Icons.lock),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10.0),
+                            ),
+                          ),
+                          obscureText: true,
+                          validator: (value) {
+                            if (value == null || value.isEmpty) {
+                              return 'Please enter your password';
+                            } else if (value.length < 6) {
+                              return 'Password must be at least 6 characters';
+                            }
+                            return null;
+                          },
+                        ),
+                        SizedBox(height: 30),
+                        _isLoading
+                            ? CircularProgressIndicator()
+                            : ElevatedButton(
+                                onPressed: _login,
+                                style: ElevatedButton.styleFrom(
+                                  padding: EdgeInsets.symmetric(
+                                      vertical: 12, horizontal: 50),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                  backgroundColor: Colors.blueAccent,
+                                ),
+                                child: Text(
+                                  'Login',
+                                  style: TextStyle(fontSize: 18, color: Colors.white),
+                                ),
+                              ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// Main TabController Page (Unchanged)
+class MainTabControllerPage extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return DefaultTabController(
+      length: 3, // Number of tabs
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text('Weather & Rain Prediction'),
+          bottom: TabBar(
+            tabs: [
+              Tab(text: 'Weather Forecast', icon: Icon(Icons.cloud)),
+              Tab(text: 'Rain Prediction', icon: Icon(Icons.umbrella)),
+            
+              Tab(text: 'Cricket Matches', icon: Icon(Icons.sports_cricket)),
+            ],
+          ),
+        ),
+        body: TabBarView(
+          children: [
+            WeatherHomePage(),
+            UnifiedWeatherScreen(),
+            HomePage(), // Display the list of matches in this tab
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+
+class CricketWeatherApp extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Cricket Weather Predictor',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+      ),
+      home: HomePage(),
+    );
+  }
+}class HomePage extends StatelessWidget {
+  // Dummy data for upcoming matches
+  final List<Map<String, String>> matches = [
+    {
+      'team1': 'India',
+      'team2': 'Australia',
+      'venue': 'Mumbai',
+      'date': '2024-11-10',
+    },
+    {
+      'team1': 'England',
+      'team2': 'Pakistan',
+      'venue': 'London',
+      'date': '2024-11-12',
+    },
+    {
+      'team1': 'South Africa',
+      'team2': 'New Zealand',
+      'venue': 'Johannesburg',
+      'date': '2024-11-15',
+    },
+  ];
+
+  // Map of team names to their corresponding flag assets
+  final Map<String, String> teamFlags = {
+    'India': 'assets/flags/ind.png',
+    'Australia': 'assets/flags/aus.png',
+    'England': 'assets/flags/eng.png',
+    'Pakistan': 'assets/flags/pak.jpeg',
+    'South Africa': 'assets/flags/sa.png',
+    'New Zealand': 'assets/flags/nz.png',
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Center(
+          child: Text(
+            'Cricket Weather Predictor',
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+          ),
+        ),
+        backgroundColor: Colors.blue[200],
+        elevation: 0,
+      ),
+      body: Stack(
+        children: [
+          // Gradient Background
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Colors.blue[200]!, Colors.blue[800]!],
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+              ),
+            ),
+          ),
+          Center(
+            child: ListView.builder(
+              itemCount: matches.length,
+              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+              itemBuilder: (context, index) {
+                final match = matches[index];
+                return Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8.0),
+                  child: Card(
+                    elevation: 8,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(15),
+                    ),
+                    child: Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [Colors.white, Colors.blue[50]!],
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        ),
+                        borderRadius: BorderRadius.circular(15),
+                      ),
+                      child: Column(
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Image.asset(
+                                teamFlags[match['team1']]!,
+                                height: 40,
+                                width: 40,
+                                fit: BoxFit.cover,
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                '${match['team1']} vs ${match['team2']}',
+                                style: const TextStyle(
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.bold,
+                                  color: Colors.blueAccent,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Image.asset(
+                                teamFlags[match['team2']]!,
+                                height: 40,
+                                width: 40,
+                                fit: BoxFit.cover,
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 16),
+                          Text(
+                            'Venue: ${match['venue']}',
+                            style: const TextStyle(fontSize: 16, color: Colors.black87),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Date: ${match['date']}',
+                            style: const TextStyle(fontSize: 16, color: Colors.black87),
+                          ),
+                          const SizedBox(height: 16),
+                          ElevatedButton(
+                            onPressed: () {
+                              // Navigate to MatchDetailsPage
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (context) => MatchDetailsPage(
+                                    team1: match['team1']!,
+                                    team2: match['team2']!,
+                                    venue: match['venue']!,
+                                    date: match['date']!,
+                                  ),
+                                ),
+                              );
+                            },
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.blueAccent,
+                              padding: const EdgeInsets.symmetric(
+                                  vertical: 12, horizontal: 24),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                            child: const Text(
+                              'View Details',
+                              style: TextStyle(fontSize: 16, color: Colors.white),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+

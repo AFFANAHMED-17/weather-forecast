@@ -3,18 +3,24 @@ import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:geolocator/geolocator.dart';
 
-class RainPredictionScreen extends StatefulWidget {
-  const RainPredictionScreen({Key? key}) : super(key: key);
+class UnifiedWeatherScreen extends StatefulWidget {
+  const UnifiedWeatherScreen({Key? key}) : super(key: key);
 
   @override
-  _RainPredictionScreenState createState() => _RainPredictionScreenState();
+  _UnifiedWeatherScreenState createState() => _UnifiedWeatherScreenState();
 }
 
-class _RainPredictionScreenState extends State<RainPredictionScreen> {
-  String place = "";
+class _UnifiedWeatherScreenState extends State<UnifiedWeatherScreen> {
+  String apiUrl = 'http://172.20.10.4:5000';
+
+  // Rain Prediction Variables
   Map<String, dynamic>? predictionData;
-  bool _isLoading = false;
-  String? _error;
+  bool _isLoadingPrediction = false;
+  String? _errorPrediction;
+
+  // Forecast Variables
+  Map<String, dynamic>? forecastData;
+  bool _isLoadingForecast = false;
 
   @override
   void initState() {
@@ -24,59 +30,44 @@ class _RainPredictionScreenState extends State<RainPredictionScreen> {
 
   Future<void> fetchUserLocation() async {
     setState(() {
-      _isLoading = true;
-      _error = null;
+      _isLoadingPrediction = true;
+      _errorPrediction = null;
       predictionData = null;
     });
 
-    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      setState(() {
-        _error = 'Location services are disabled.';
-        _isLoading = false;
-      });
-      return;
-    }
-
-    LocationPermission permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied) {
-        setState(() {
-          _error = 'Location permissions are denied';
-          _isLoading = false;
-        });
-        return;
-      }
-    }
-
-    if (permission == LocationPermission.deniedForever) {
-      setState(() {
-        _error = 'Location permissions are permanently denied.';
-        _isLoading = false;
-      });
-      return;
-    }
-
     try {
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) throw Exception('Location services are disabled.');
+
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+        if (permission == LocationPermission.denied) {
+          throw Exception('Location permissions are denied');
+        }
+      }
+
+      if (permission == LocationPermission.deniedForever) {
+        throw Exception('Location permissions are permanently denied.');
+      }
+
       Position position = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high,
       );
       String lat = position.latitude.toString();
       String lon = position.longitude.toString();
-      place = "$lat,$lon";
 
       await fetchRainPrediction(lat, lon);
     } catch (e) {
       setState(() {
-        _error = 'Failed to get location. Please try again.';
-        _isLoading = false;
+        _errorPrediction = e.toString();
+        _isLoadingPrediction = false;
       });
     }
   }
 
   Future<void> fetchRainPrediction(String lat, String lon) async {
-    final url = Uri.parse('http://192.168.1.8:3000/predict_any');
+    final url = Uri.parse('$apiUrl/predict_any');
     Map<String, String> body = {'lat': lat, 'lon': lon};
 
     try {
@@ -90,75 +81,112 @@ class _RainPredictionScreenState extends State<RainPredictionScreen> {
         final data = json.decode(response.body);
         setState(() {
           predictionData = data;
+          _isLoadingPrediction = false;
         });
       } else {
-        final data = json.decode(response.body);
-        setState(() {
-          _error = data['error'] ?? 'An unexpected error occurred.';
-        });
+        throw Exception('Failed to fetch prediction data.');
       }
     } catch (e) {
       setState(() {
-        _error = 'Failed to fetch data. Please ensure the backend is running.';
-      });
-    } finally {
-      setState(() {
-        _isLoading = false;
+        _errorPrediction = e.toString();
+        _isLoadingPrediction = false;
       });
     }
   }
 
+  Future<void> fetchSimulatedForecast() async {
+    setState(() {
+      _isLoadingForecast = true;
+    });
+
+    try {
+      final response = await http.get(Uri.parse('$apiUrl/forecast_simulation'));
+
+      if (response.statusCode == 200) {
+        setState(() {
+          forecastData = json.decode(response.body);
+          _isLoadingForecast = false;
+        });
+      } else {
+        throw Exception('Failed to fetch simulated forecast.');
+      }
+    } catch (e) {
+      setState(() {
+        _isLoadingForecast = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to fetch simulated forecast data.')),
+      );
+    }
+  }
+
+  Future<void> fetchLiveForecast(String lat, String lon) async {
+    setState(() {
+      _isLoadingForecast = true;
+    });
+
+    try {
+      final response = await http.get(Uri.parse('$apiUrl/live_forecast?lat=$lat&lon=$lon'));
+
+      if (response.statusCode == 200) {
+        setState(() {
+          forecastData = json.decode(response.body);
+          _isLoadingForecast = false;
+        });
+      } else {
+        throw Exception('Failed to fetch live forecast.');
+      }
+    } catch (e) {
+      setState(() {
+        _isLoadingForecast = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to fetch live forecast data.')),
+      );
+    }
+  }
+
   Widget _buildPredictionCard(String title, Map<String, dynamic> data) {
+    return Expanded(
+      child: Card(
+        elevation: 10,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        color: title == 'Today' ? Colors.lightBlue[100] : Colors.lightGreen[100],
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: const TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text('Rain: ${data['RainToday'] ?? data['RainTomorrow'] ? "☔ Yes" : "🌤️ No"}'),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildForecastView() {
+    if (forecastData == null) return const Text('No forecast data available.');
     return Card(
       elevation: 10,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(20),
-      ),
-      color: title == 'Today' ? Colors.lightBlue[100] : Colors.lightGreen[100],
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
       child: Padding(
-        padding: const EdgeInsets.all(20.0),
+        padding: const EdgeInsets.all(16.0),
         child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              title,
-              style: TextStyle(
-                fontSize: 26,
-                fontWeight: FontWeight.bold,
-                foreground: Paint()
-                  ..shader = LinearGradient(
-                    colors: [Colors.blueAccent, Colors.purpleAccent],
-                  ).createShader(Rect.fromLTWH(0, 0, 100, 100)),
-              ),
-            ),
-            const SizedBox(height: 10),
-            Icon(
-              data['RainToday'] ? Icons.cloud : Icons.wb_sunny,
-              color: data['RainToday'] ? Colors.blue : Colors.orange,
-              size: 60,
-            ),
-            const SizedBox(height: 10),
-            Text(
-              'Location: ${data['Location']}',
-              style: TextStyle(fontSize: 18, color: Colors.blueGrey[800]),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              'Rain Today: ${data['RainToday'] ? "☔ Yes" : "🌤️ No"}',
-              style: TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.bold,
-                color: data['RainToday'] ? Colors.redAccent : Colors.green,
-              ),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              'Rain Tomorrow: ${data['RainTomorrow'] ? "☔ Yes" : "🌤️ No"}',
-              style: TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.bold,
-                color: data['RainTomorrow'] ? Colors.redAccent : Colors.green,
-              ),
-            ),
+            Text('Rain Start: ${forecastData!['rain_start'] ?? 'N/A'}'),
+            Text('Rain End: ${forecastData!['rain_end'] ?? 'N/A'}'),
+            Text('Duration: ${forecastData!['duration'] ?? 'N/A'}'),
+            Text('Match Status: ${forecastData!['match_status'] ?? 'N/A'}'),
           ],
         ),
       ),
@@ -167,63 +195,81 @@ class _RainPredictionScreenState extends State<RainPredictionScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [Colors.blue[50]!, Colors.blue[200]!],
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-        ),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          children: [
-            ElevatedButton(
-              onPressed: _isLoading ? null : fetchUserLocation,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.deepPurpleAccent,
-                padding: const EdgeInsets.symmetric(vertical: 15, horizontal: 30),
+    return Scaffold(
+      body: Stack(
+        children: [
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Colors.blue[200]!, Colors.blue[800]!],
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+              ),
+            ),
+          ),
+          Center(
+            child: SingleChildScrollView(
+              child: Card(
+                elevation: 10,
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(20),
                 ),
-                shadowColor: Colors.deepPurple,
-                elevation: 10,
-                textStyle: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                margin: const EdgeInsets.symmetric(horizontal: 16.0),
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    children: [
+                      const Text(
+                        ' Weather Prediction',
+                        style: TextStyle(
+                          fontSize: 26,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.blueAccent,
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      ElevatedButton(
+                        onPressed: fetchUserLocation,
+                        child: const Text('Refresh Prediction'),
+                      ),
+                      const SizedBox(height: 20),
+                      if (_isLoadingPrediction)
+                        const CircularProgressIndicator()
+                      else if (_errorPrediction != null)
+                        Text(
+                          _errorPrediction!,
+                          style: const TextStyle(color: Colors.red, fontSize: 16),
+                        )
+                      else if (predictionData != null)
+                        Row(
+                          children: [
+                            _buildPredictionCard('Today', predictionData!),
+                            const SizedBox(width: 10),
+                            _buildPredictionCard('Tomorrow', predictionData!),
+                          ],
+                        ),
+                      const SizedBox(height: 20),
+                      ElevatedButton(
+                        onPressed: fetchSimulatedForecast,
+                        child: const Text('Get Live Forecast'),
+                      ),
+                      const SizedBox(height: 20),
+                      // ElevatedButton(
+                      //   onPressed: () => fetchLiveForecast('12.97', '77.59'),
+                      //   child: const Text('Get Live Forecast'),
+                      // ),
+                      const SizedBox(height: 20),
+                      if (_isLoadingForecast)
+                        const CircularProgressIndicator()
+                      else if (forecastData != null)
+                        _buildForecastView(),
+                    ],
+                  ),
+                ),
               ),
-              child: const Text('Refresh Rain Prediction'),
             ),
-            const SizedBox(height: 20),
-            if (_isLoading)
-              const CircularProgressIndicator()
-            else if (_error != null)
-              Text(
-                _error!,
-                style: const TextStyle(color: Colors.redAccent, fontSize: 18),
-              )
-            else if (predictionData != null)
-              Column(
-                children: [
-                  _buildPredictionCard('Today', {
-                    "Location": predictionData!['Location'],
-                    "RainToday": predictionData!['RainToday'],
-                    "RainTomorrow": predictionData!['RainTomorrow']
-                  }),
-                  const SizedBox(height: 10),
-                  _buildPredictionCard('Tomorrow', {
-                    "Location": predictionData!['Location'],
-                    "RainToday": predictionData!['RainToday'],
-                    "RainTomorrow": predictionData!['RainTomorrow']
-                  }),
-                ],
-              )
-            else
-              const Text(
-                'Press the button to get rain prediction.',
-                style: TextStyle(fontSize: 18, color: Colors.black),
-              ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }

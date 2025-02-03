@@ -101,7 +101,7 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
     final lon = _currentPosition!.longitude.toString();
 
     // Replace with your backend URL
-    final backendUrl = 'http://192.168.1.8:3000/api/forecast';
+    final backendUrl = 'http://172.20.10.4:5000/api/forecast';
     final url = Uri.parse('$backendUrl?lat=$lat&lon=$lon');
 
     try {
@@ -179,28 +179,28 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
     return Scaffold(
       appBar: AppBar(
         title: Text('Weather Forecast'),
-        backgroundColor: Colors.deepPurpleAccent,
+        backgroundColor: Colors.blue[200],
         centerTitle: true,
       ),
       body: Padding(
         padding: EdgeInsets.all(MediaQuery.of(context).size.width * 0.05), // Responsive padding
         child: Column(
           children: [
-            ElevatedButton(
-              onPressed: _isLoading ? null : _getCurrentLocation,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.deepPurple, // Updated parameter
-                padding: const EdgeInsets.symmetric(vertical: 15, horizontal: 30),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(30),
-                ),
-                textStyle: TextStyle(
-                  fontSize: MediaQuery.of(context).size.width * 0.045, // Responsive font size
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              child: Text('Refresh Forecast'),
-            ),
+            // ElevatedButton(
+            //   onPressed: _isLoading ? null : _getCurrentLocation,
+            //   style: ElevatedButton.styleFrom(
+            //     backgroundColor: Colors.blueAccent, // Updated parameter
+            //     padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 10),
+            //     shape: RoundedRectangleBorder(
+            //       borderRadius: BorderRadius.circular(20),
+            //     ),
+            //     textStyle: TextStyle(
+            //       fontSize: MediaQuery.of(context).size.width * 0.045, // Responsive font size
+            //       fontWeight: FontWeight.bold,
+            //     ),
+            //   ),
+            //   child: Text('Refresh Forecast'),
+            // ),
             SizedBox(height: 20),
             if (_isLoading)
               CircularProgressIndicator()

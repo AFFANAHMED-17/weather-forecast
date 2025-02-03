@@ -1,21 +1,33 @@
 name: weather_rain_app
 description: A Flutter application for weather forecasting and rain prediction.
 
-
+# The version of your application.
 version: 1.0.0+1
 
+# The environment specification.
 environment:
   sdk: ">=2.17.0 <3.0.0"
 
+# Dependencies required by the application.
 dependencies:
   flutter:
     sdk: flutter
   http: ^0.13.5
   geolocator: ^9.0.2
+  # Removed the validator package to resolve versioning issue
+  # You can add another validation package here if needed, e.g.
+  form_field_validator: 1.1.0
 
+# Development-only dependencies.
 dev_dependencies:
   flutter_test:
     sdk: flutter
 
+# Flutter-specific settings.
 flutter:
   uses-material-design: true
+
+  # Specify assets used in the application.
+  assets:
+    - assets/flags/
+    # - assets/images/
